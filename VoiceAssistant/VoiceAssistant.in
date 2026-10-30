@@ -1,0 +1,511 @@
+/*
+ * ESP32-S3 Voice Assistant v1.0
+ * Target: ESP32-S3-N16R8 (16 MB Flash + 8 MB OPI PSRAM)
+ * Framework: Arduino-ESP32 3.3.5
+ *
+ * Audio hardware defaults (verify these pins against the exact carrier board):
+ * INMP441: BCLK=GPIO5, WS=GPIO4, SD=GPIO6, L/R=GND (left channel)
+ * MAX98357A: BCLK=GPIO15, LRC=GPIO16, DIN=GPIO7, VIN=5V, GND=GND
+ * Speaker: connect only between MAX98357A SPK+ and SPK- (BTL output).
+ *
+ * Arduino-ESP32 3.3.5 auto-allocates I2S controllers. The microphone is
+ * initialized first and stays active; the speaker starts later while mic RX
+ * remains allocated, so ESP32-S3 can assign playback to the other controller.
+ * INMP441 24-bit samples are transformed from 32-bit I2S slots to 16-bit PCM.
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <NetworkClient.h>
+#include <NetworkClientSecure.h>
+#include <ESP_I2S.h>
+#include <esp_srmodel.h>
+#include <esp_mn_iface.h>
+#include <esp_mn_models.h>
+#include <esp_mn_speech_commands.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <ArduinoJson.h>
+#include <esp_afe_config.h>
+#include <esp_afe_sr_iface.h>
+#include <esp_afe_sr_models.h>  // Declares esp_afe_handle_from_config() in ESP-SR
+#include <esp_system.h>
+#include <esp_partition.h>
+#include <esp_err.h>
+#include <esp_heap_caps.h>
+#include <esp_mac.h>
+#include <mbedtls/base64.h>
+#include <memory>
+#include <vector>
+
+// --------------------------- Hardware configuration ------------------------
+static constexpr int MIC_BCLK_PIN = 5;
+static constexpr int MIC_WS_PIN   = 4;
+static constexpr int MIC_DIN_PIN  = 6;
+static constexpr int SPK_BCLK_PIN = 15;
+static constexpr int SPK_WS_PIN   = 16;
+static constexpr int SPK_DOUT_PIN = 7;
+
+static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
+static constexpr uint32_t TTS_FALLBACK_RATE = 24000;
+static constexpr uint32_t SERIAL_BAUD = 115200;
+static constexpr size_t MAX_RECORD_SECONDS = 8;
+static constexpr size_t MAX_AUDIO_BYTES = AUDIO_SAMPLE_RATE * MAX_RECORD_SECONDS * sizeof(int16_t);
+static constexpr char AP_PASSWORD[] = "voice1234";
+static constexpr char FW_VERSION[] = "1.1.0-multinet";
+
+// --------------------------- Runtime objects --------------------------------
+WebServer server(80);
+Preferences prefs;
+I2SClass micI2S;
+I2SClass speakerI2S;
+
+struct Config {
+  String wifiSsid;
+  String wifiPassword;
+
+  String llmProvider = "deepseek";
+  String llmEndpoint = "https://api.deepseek.com/chat/completions";
+  String llmApiKey;
+  String llmModel = "deepseek-chat";
+  String systemPrompt = "你是一个简洁、准确的中文语音助手。回答适合语音播报，不要使用 Markdown 表格。";
+
+  String asrProvider = "qwen-audio-asr-http";
+  String asrEndpoint = "https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
+  String asrApiKey;
+  String asrModel = "qwen-audio-3.1-asr-flash";
+
+  String ttsProvider = "dashscope-qwen";
+  String ttsEndpoint = "https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer";
+  String ttsApiKey;
+  String ttsModel = "qwen-audio-3.1-tts-flash";
+  String ttsVoice = "longanhuan_v3.1";
+  float ttsSpeed = 1.0f;
+
+  String wakeWordZh = "你好大肥鱼";
+  String wakeWordPinyin = "ni hao da fei yu";
+  uint8_t wakeThreshold = 20;       // XiaoZhi-style percentage; lower is more sensitive
+  uint16_t wakeDurationMs = 3000;   // MultiNet detection window
+  bool noiseSuppression = true;
+  bool keepApEnabled = true;
+};
+
+Config cfg;
+volatile bool wakePending = false;
+volatile bool srStarted = false;
+volatile bool assistantBusy = false;
+
+// MultiNet runtime. The microphone I2S peripheral is shared with the cloud-ASR
+// recording path, so both readers are serialized by micMutex.
+static srmodel_list_t *srModels = nullptr;
+static esp_mn_iface_t *multiNet = nullptr;
+static model_iface_data_t *multiNetData = nullptr;
+static char *multiNetName = nullptr;  // owned by srModels
+static TaskHandle_t multiNetTaskHandle = nullptr;
+static SemaphoreHandle_t micMutex = nullptr;
+static volatile bool multiNetTaskRunning = false;
+static size_t multiNetFrameSamples = 0;
+static int16_t *multiNetFrame = nullptr;
+static size_t multiNetFrameFill = 0;
+static const esp_afe_sr_iface_t *wakeAfe = nullptr;
+static esp_afe_sr_data_t *wakeAfeData = nullptr;
+static int16_t *wakeAfeFeedFrame = nullptr;
+static size_t wakeAfeFeedSamples = 0;
+static size_t wakeAfeFeedChannels = 0;
+static size_t wakeAfeFetchSamples = 0;
+static String recognizerStatus = "未初始化";
+bool wifiConnecting = false;
+bool apActive = false;
+unsigned long wifiAttemptAt = 0;
+unsigned long lastWifiRetryAt = 0;
+String stageText = "启动中";
+String lastTranscript;
+String lastReply;
+String lastError;
+String lastNsStatus = "未初始化";
+
+struct ChatTurn {
+  String role;
+  String content;
+};
+std::vector<ChatTurn> conversation;
+
+// Streaming srmodels.bin uploader. A failed upload leaves the model partition
+// blank/invalid, but the startup guard keeps the device in AP/Web mode.
+static const esp_partition_t *modelUploadPartition = nullptr;
+static bool modelUploadOk = false;
+static size_t modelUploadOffset = 0;
+static size_t modelUploadBuffered = 0;
+static bool modelUploadHadError = false;
+alignas(4) static uint8_t modelUploadBuffer[4096];
+
+// --------------------------- Utility functions -----------------------------
+String deviceId() {
+  uint64_t mac = ESP.getEfuseMac();
+  char id[9];
+  snprintf(id, sizeof(id), "%06llX", (unsigned long long)(mac & 0xFFFFFF));
+  return String(id);
+}
+
+String jsonString(const JsonVariantConst &v, const String &fallback = "") {
+  if (v.is<const char*>()) return String(v.as<const char*>());
+  if (v.is<String>()) return v.as<String>();
+  return fallback;
+}
+
+void loadConfig() {
+  prefs.begin("voicecfg", true);
+  cfg.wifiSsid = prefs.getString("wssid", "");
+  cfg.wifiPassword = prefs.getString("wpass", "");
+  cfg.llmProvider = prefs.getString("lp", cfg.llmProvider);
+  cfg.llmEndpoint = prefs.getString("le", cfg.llmEndpoint);
+  cfg.llmApiKey = prefs.getString("lk", "");
+  cfg.llmModel = prefs.getString("lm", cfg.llmModel);
+  cfg.systemPrompt = prefs.getString("sp", cfg.systemPrompt);
+  cfg.asrProvider = prefs.getString("ap", cfg.asrProvider);
+  cfg.asrEndpoint = prefs.getString("ae", cfg.asrEndpoint);
+  cfg.asrApiKey = prefs.getString("ak", "");
+  cfg.asrModel = prefs.getString("am", cfg.asrModel);
+  cfg.ttsProvider = prefs.getString("tp", cfg.ttsProvider);
+  cfg.ttsEndpoint = prefs.getString("te", cfg.ttsEndpoint);
+  cfg.ttsApiKey = prefs.getString("tk", "");
+  cfg.ttsModel = prefs.getString("tm", cfg.ttsModel);
+  cfg.ttsVoice = prefs.getString("tv", cfg.ttsVoice);
+  cfg.ttsSpeed = prefs.getFloat("ts", 1.0f);
+  cfg.wakeWordZh = prefs.getString("wz", cfg.wakeWordZh);
+  cfg.wakeWordPinyin = prefs.getString("wp", cfg.wakeWordPinyin);
+  cfg.wakeThreshold = prefs.getUChar("wth", cfg.wakeThreshold);
+  cfg.wakeDurationMs = prefs.getUShort("wdur", cfg.wakeDurationMs);
+  // Migrate the original placeholder to the user's selected wake phrase.
+  if (cfg.wakeWordZh == "你好小智" || cfg.wakeWordZh.isEmpty()) {
+    cfg.wakeWordZh = "你好大肥鱼";
+  }
+  if (cfg.wakeWordPinyin == "ni hao xiao zhi" || cfg.wakeWordPinyin.isEmpty() ||
+      cfg.wakeWordPinyin == "ni3 hao3 da4 fei2 yu2") {
+    cfg.wakeWordPinyin = "ni hao da fei yu";
+  }
+  cfg.noiseSuppression = prefs.getBool("ns", true);
+  cfg.keepApEnabled = prefs.getBool("kap", true);
+  prefs.end();
+}
+
+void saveConfig() {
+  prefs.begin("voicecfg", false);
+  prefs.putString("wssid", cfg.wifiSsid);
+  prefs.putString("wpass", cfg.wifiPassword);
+  prefs.putString("lp", cfg.llmProvider);
+  prefs.putString("le", cfg.llmEndpoint);
+  prefs.putString("lk", cfg.llmApiKey);
+  prefs.putString("lm", cfg.llmModel);
+  prefs.putString("sp", cfg.systemPrompt);
+  prefs.putString("ap", cfg.asrProvider);
+  prefs.putString("ae", cfg.asrEndpoint);
+  prefs.putString("ak", cfg.asrApiKey);
+  prefs.putString("am", cfg.asrModel);
+  prefs.putString("tp", cfg.ttsProvider);
+  prefs.putString("te", cfg.ttsEndpoint);
+  prefs.putString("tk", cfg.ttsApiKey);
+  prefs.putString("tm", cfg.ttsModel);
+  prefs.putString("tv", cfg.ttsVoice);
+  prefs.putFloat("ts", cfg.ttsSpeed);
+  prefs.putString("wz", cfg.wakeWordZh);
+  prefs.putString("wp", cfg.wakeWordPinyin);
+  prefs.putUChar("wth", cfg.wakeThreshold);
+  prefs.putUShort("wdur", cfg.wakeDurationMs);
+  prefs.putBool("ns", cfg.noiseSuppression);
+  prefs.putBool("kap", cfg.keepApEnabled);
+  prefs.end();
+}
+
+String ipAddress() {
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+  return WiFi.softAPIP().toString();
+}
+
+void setStage(const String &s) {
+  stageText = s;
+  Serial.printf("[STATE] %s\n", s.c_str());
+}
+
+void sendJson(int code, JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(code, "application/json; charset=utf-8", out);
+}
+
+bool startsWithHttps(const String &url) { return url.startsWith("https://"); }
+
+std::unique_ptr<NetworkClientSecure> makeTlsClient() {
+  auto c = std::unique_ptr<NetworkClientSecure>(new NetworkClientSecure());
+  // Prototype mode: certificate verification is disabled for broad provider compatibility.
+  // Do not expose this device or its API keys to untrusted networks.
+  c->setInsecure();
+  return c;
+}
+
+bool httpBegin(HTTPClient &http, NetworkClientSecure &client, const String &url) {
+  if (!startsWithHttps(url)) {
+    lastError = "API 地址必须使用 HTTPS";
+    return false;
+  }
+  http.setConnectTimeout(15000);
+  http.setTimeout(45000);
+  http.setReuse(false);
+  // Arduino-ESP32 3.3.5 HTTPClient expects its NetworkClient base type.
+  // Pass the base explicitly to avoid overload-resolution failures in some
+  // ArduinoDroid/Clang builds. NetworkClientSecure derives from NetworkClient.
+  NetworkClient &baseClient = static_cast<NetworkClient &>(client);
+  return http.begin(baseClient, url);
+}
+
+void addBearer(HTTPClient &http, const String &key) {
+  http.addHeader("Authorization", "Bearer " + key);
+}
+
+uint32_t readLE32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+uint16_t readLE16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+void writeLE16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
+void writeLE32(uint8_t *p, uint32_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff; }
+
+// --------------------------- Web administration ----------------------------
+const char INDEX_HTML[] PROGMEM =
+  "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>语音助手控制台</title>\n"
+  "<style>\n"
+  ":root{color-scheme:dark;--bg:#0a1020;--panel:#151f33;--line:#2b3a56;--txt:#e9efff;--muted:#a6b4ce;--blue:#78aaff;--green:#41d6a2;--red:#ff8a8a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#101d36,#080d18 70%);font:15px system-ui,\"Microsoft YaHei\",sans-serif;color:var(--txt)}main{max-width:920px;margin:auto;padding:18px 13px 60px}.top{display:flex;justify-content:space-between;align-items:center;gap:10px}.brand{font-size:23px;font-weight:800}.muted,.hint{color:var(--muted);font-size:12px;line-height:1.55}.pill{padding:7px 11px;border:1px solid var(--line);border-radius:18px;color:var(--green);font-size:12px}.card{background:#151f33ee;border:1px solid var(--line);border-radius:15px;padding:16px;margin:13px 0}.card h2{font-size:16px;margin:0 0 13px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{display:flex;flex-direction:column;gap:6px;margin-bo"
+  "ttom:10px}.full{grid-column:1/-1}label{color:var(--muted);font-size:13px}input,select,textarea{background:#0b1426;color:var(--txt);border:1px solid #344866;border-radius:9px;padding:11px;font:inherit;width:100%;min-width:0}textarea{min-height:78px;resize:vertical}button{border:0;background:var(--blue);color:#07152e;font-weight:750;border-radius:9px;padding:11px 15px;font-size:14px}button.alt{background:#2a3a58;color:var(--txt)}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.row button{flex:0 0 auto}.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.tile{background:#0d172a;border:1px solid var(--line);border-radius:10px;padding:11px;overflow-wrap:anywhere}.tile small{display:block;color:var(--muted)}.tile b{display:block;margin-top:5px}.status{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);font-size:13px}.warn{color:#ffd28b}.ok{colo"
+  "r:var(--green)}.actions{display:flex;gap:9px;flex-wrap:wrap}.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#263b5d;padding:11px 16px;border-radius:10px;display:none;max-width:92%;z-index:9}@media(max-width:650px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.tiles{grid-template-columns:1fr 1fr}.top{align-items:flex-start}}\n"
+  "</style></head><body><main>\n"
+  "<div class=\"top\"><div><div class=\"brand\">ESP32-S3 语音助手</div><div class=\"muted\">本地设备管理 · 固件 v1.1.0 MultiNet</div></div><div class=\"pill\" id=\"online\">读取状态中</div></div>\n"
+  "<section class=\"card\"><h2>设备状态</h2><div class=\"tiles\"><div class=\"tile\"><small>网络</small><b id=\"wifi\">--</b></div><div class=\"tile\"><small>访问地址</small><b id=\"ip\">--</b></div><div class=\"tile\"><small>可用 RAM</small><b id=\"heap\">--</b></div><div class=\"tile\"><small>可用 PSRAM</small><b id=\"psram\">--</b></div><div class=\"tile\"><small>语音状态</small><b id=\"stage\">--</b></div><div class=\"tile\"><small>降噪状态</small><b id=\"ns\">--</b></div></div><p class=\"status\" id=\"last\"></p></section>\n"
+  "<form id=\"settings\">\n"
+  "<section class=\"card\"><h2>1. Wi-Fi</h2><div class=\"field full\"><label>扫描到的网络</label><div class=\"row\"><select id=\"networks\"><option value=\"\">点击右侧扫描</option></select><button type=\"button\" class=\"alt\" onclick=\"scan()\">扫描</button></div></div><div class=\"grid\"><div class=\"field\"><label>SSID</label><input name=\"wifiSsid\" id=\"wifiSsid\" autocomplete=\"off\"></div><div class=\"field\"><label>密码（留空不修改）</label><input name=\"wifiPassword\" id=\"wifiPassword\" type=\"password\" autocomplete=\"new-password\"></div></div><label><input style=\"width:auto\" type=\"checkbox\" name=\"keepApEnabled\" id=\"keepApEnabled\"> 保留配置热点，方便故障恢复</label><p class=\"hint\">首次启动连接热点 Voice-Assistant-设备编号，密码 voice1234，访问 http://192.168.4.1 。</p></section>\n"
+  "<section class=\"card\"><h2>2. 大模型（LLM）</h2><div class=\"grid\"><div class=\"field\"><label>服务商</label><select name=\"llmProvider\" id=\"llmProvider\"><option value=\"deepseek\">DeepSeek</option><option value=\"qwen-compatible\">阿里云百炼（OpenAI 兼容）</option><option value=\"openai\">OpenAI</option><option value=\"custom\">自定义兼容接口</option></select></div><div class=\"field\"><label>模型名称</label><input name=\"llmModel\" id=\"llmModel\" placeholder=\"deepseek-chat\"></div><div class=\"field full\"><label>完整 Chat Completions URL</label><input name=\"llmEndpoint\" id=\"llmEndpoint\" placeholder=\"https://api.deepseek.com/chat/completions\"></div><div class=\"field full\"><label>API Key（留空不修改）</label><input name=\"llmApiKey\" id=\"llmApiKey\" type=\"password\" placeholder=\"已保存的 Key 不会回传\"></div><div class=\"field full\"><label>系统提示词</label><textarea name=\"systemPrompt\" id=\"systemPrompt\"></textarea></div></div></section>\n"
+  "<section class=\"card\"><h2>3. 语音识别（ASR）</h2><div class=\"grid\"><div class=\"field\"><label>服务商/协议</label><select name=\"asrProvider\" id=\"asrProvider\"><option value=\"qwen-audio-asr-http\">阿里云百炼 Qwen Audio ASR 3.1（原生 HTTP）</option><option value=\"openai-compatible\">OpenAI 兼容音频转写</option><option value=\"custom\">自定义 multipart 转写接口</option></select></div><div class=\"field\"><label>模型</label><input name=\"asrModel\" id=\"asrModel\" placeholder=\"qwen-audio-3.1-asr-flash / gpt-4o-mini-transcribe\"></div><div class=\"field full\"><label>完整转写 URL（按所选协议填写）</label><input name=\"asrEndpoint\" id=\"asrEndpoint\"></div><div class=\"field full\"><label>API Key（留空不修改）</label><input name=\"asrApiKey\" id=\"asrApiKey\" type=\"password\" placeholder=\"已保存的 Key 不会回传\"></div></div><p class=\"hint\">Qwen Audio ASR 使用百炼原生 HTTP 接口，固件把 WAV 转成 Base64 Data URI 发送；模型建议填 qwen-audio-3.1-asr-flash。也支持 OpenAI multipart 兼容接口。请先将 YOUR_WORKSPACE_ID 替换为百炼"
+  "控制台中的 Workspace ID，并使用该地域对应的 API Key。</p></section>\n"
+  "<section class=\"card\"><h2>4. 语音合成（TTS）</h2><div class=\"grid\"><div class=\"field\"><label>服务商/协议</label><select name=\"ttsProvider\" id=\"ttsProvider\"><option value=\"dashscope-qwen\">阿里云百炼 Qwen Audio TTS HTTP</option><option value=\"openai-compatible\">OpenAI 兼容 audio/speech</option></select></div><div class=\"field\"><label>模型</label><input name=\"ttsModel\" id=\"ttsModel\"></div><div class=\"field full\"><label>完整 TTS URL</label><input name=\"ttsEndpoint\" id=\"ttsEndpoint\"></div><div class=\"field\"><label>API Key（留空不修改）</label><input name=\"ttsApiKey\" id=\"ttsApiKey\" type=\"password\" placeholder=\"已保存的 Key 不会回传\"></div><div class=\"field\"><label>音色</label><input name=\"ttsVoice\" id=\"ttsVoice\"></div><div class=\"field\"><label>语速（0.5–2.0）</label><input name=\"ttsSpeed\" id=\"ttsSpeed\" type=\"number\" min=\"0.5\" max=\"2\" step=\"0.1\"></div></div><p class=\"hint\">DashScope 模式请求 WAV/24 kHz，并根据返回的音频 URL 下载后播放。Endpoint 请填写百炼控制台对应"
+  "地域的 SpeechSynthesizer 地址。</p></section>\n"
+  "<section class=\"card\"><h2>5. 自定义唤醒词（ESP-SR MultiNet 6）</h2><div class=\"grid\"><div class=\"field\"><label>唤醒词中文</label><input name=\"wakeWordZh\" id=\"wakeWordZh\" maxlength=\"48\"></div><div class=\"field\"><label>拼音（不带声调数字，音节用空格分开）</label><input name=\"wakeWordPinyin\" id=\"wakeWordPinyin\" placeholder=\"ni hao da fei yu\" maxlength=\"96\"></div><div class=\"field\"><label>识别灵敏度（1–99，越小越灵敏）</label><input name=\"wakeThreshold\" id=\"wakeThreshold\" type=\"number\" min=\"1\" max=\"99\"></div><div class=\"field\"><label>检测窗口（毫秒）</label><input name=\"wakeDurationMs\" id=\"wakeDurationMs\" type=\"number\" min=\"1000\" max=\"5000\" step=\"500\"></div></div><div class=\"field full\"><label>ESP-SR 模型文件（包含 mn6_cn + fst 的 srmodels.bin）</label><input id=\"modelFile\" type=\"file\" accept=\".bin,application/octet-stream\"><div class=\"row\"><button type=\"button\" class=\"alt\" onclick=\"uploadModel()\">上传 MultiNet 模型到 model 分区</button><span class=\"status\" id=\"modelStatus\">模型状态读取中</span></div></div><label><input style=\"width:auto\" type=\"checkbox\" id=\"noiseSuppression\" name=\"noiseSuppression\"> 启用云端 ASR 录音的额外 AFE WebRTC NS（唤醒检测路径始终使用 AFE + NS）</label><p class=\"hint warn\">默认唤醒词：你好大肥鱼；MultiNet 6 中文拼音：ni hao da fei yu（不带声调数字）。这不是重新训练神经网络：固件把拼音命令动态加入预训练的 mn6_cn。先用下方 GitHub Actions 生成包含 mn6_cn 和 fst 的通用 srmodels.bin，再上传。修改唤醒词/阈值后需要重启生效。上传会擦除整个 model 分区，请勿断电。</p></section>\n"
+  "<div class=\"actions\"><button type=\"submit\">保存全部配置</button><button class=\"alt\" type=\"button\" onclick=\"loadConfig()\">重新读取</button><button class=\"alt\" type=\"button\" onclick=\"reboot()\">重启设备</button></div>\n"
+  "</form>\n"
+  "<section class=\"card\"><h2>文本链路测试</h2><div class=\"field\"><label>输入一段文字，测试 LLM + TTS（无需唤醒词）</label><textarea id=\"testText\" placeholder=\"你好，请介绍一下你自己\"></textarea></div><button onclick=\"testChat()\">发送并语音播报</button><p class=\"status\" id=\"testResult\"></p></section>\n"
+  "<p class=\"hint\">安全提示：此版本为个人局域网原型，HTTPS 证书校验暂时关闭；不要将管理端口暴露到公网。首次烧录后建议尽快设置独立管理密码（当前版本尚未加入网页登录）。</p>\n"
+  "</main><div class=\"toast\" id=\"toast\"></div>\n"
+  "<script>\n"
+  "const $=id=>document.getElementById(id);function toast(t){$('toast').textContent=t;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2800)}\n"
+  "async function api(path,opt={}){const r=await fetch(path,opt);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw Error(j.error||('HTTP '+r.status));return j}\n"
+  "async function loadConfig(){try{let c=await api('/api/config');for(const [k,v] of Object.entries(c)){if($(k)){if($(k).type==='checkbox')$(k).checked=!!v;else $(k).value=v??''}}$('online').textContent='设备在线'}catch(e){toast('读取失败：'+e.message)}}\n"
+  "async function refresh(){try{let s=await api('/api/status');$('wifi').textContent=s.wifi;$('ip').textContent=s.ip;$('heap').textContent=s.heap+' KB';$('psram').textContent=s.psram+' KB';$('stage').textContent=s.stage;$('ns').textContent=s.ns;$('modelStatus').textContent=s.modelStatus||s.recognizer||'未知';$('last').textContent='识别：'+(s.transcript||'--')+'\\n回答：'+(s.reply||'--')+'\\n错误：'+(s.error||'无');$('online').textContent='在线'}catch(e){$('online').textContent='离线'}}\n"
+  "async function scan(){try{toast('扫描中…');let s=await api('/api/scan');$('networks').innerHTML='<option value=\"\">选择 Wi-Fi</option>';s.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)'+(n.secure?' 🔒':'');$('networks').appendChild(o)});toast('扫描完成：'+s.networks.length+' 个网络')}catch(e){toast('扫描失败：'+e.message)}}\n"
+  "$('networks').addEventListener('change',e=>{if(e.target.value)$('wifiSsid').value=e.target.value});\n"
+  "$('settings').addEventListener('submit',async e=>{e.preventDefault();let d={};new FormData(e.target).forEach((v,k)=>d[k]=v);['noiseSuppression','keepApEnabled'].forEach(k=>d[k]=$(k).checked);d.ttsSpeed=Number(d.ttsSpeed||1);d.wakeThreshold=Number(d.wakeThreshold||20);d.wakeDurationMs=Number(d.wakeDurationMs||3000);try{let r=await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});toast(r.message||'已保存');setTimeout(refresh,1500)}catch(e){toast('保存失败：'+e.message)}});\n"
+  "async function reboot(){if(!confirm('确认重启设备？'))return;await api('/api/reboot',{method:'POST'});toast('设备正在重启')}\n"
+  "async function uploadModel(){const f=$('modelFile').files[0];if(!f)return toast('先选择 srmodels.bin');if(!confirm('上传会先擦除整个 model 分区。请确认文件是为当前 ESP-SR/Arduino Core 版本生成的，且供电稳定。继续？'))return;const fd=new FormData();fd.append('model',f,f.name);$('modelStatus').textContent='正在上传：'+f.name;try{const r=await fetch('/api/model',{method:'POST',body:fd});let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw Error(j.error||('HTTP '+r.status));$('modelStatus').textContent=j.message||'上传完成，请重启';toast('模型文件已写入，请重启设备');}catch(e){$('modelStatus').textContent='上传失败：'+e.message;toast('模型上传失败')}}\n" 
+  "async function testChat(){let t=$('testText').value.trim();if(!t)return toast('请输入测试文本');$('testResult').textContent='请求中…';try{let r=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});$('testResult').textContent=r.reply||'完成';}catch(e){$('testResult').textContent='失败：'+e.message}}\n"
+  "loadConfig();refresh();setInterval(refresh,4000);\n"
+  "</script></body></html>";
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+const esp_partition_t *findModelPartition() {
+  return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+}
+
+bool modelPartitionBlank(const esp_partition_t *part) {
+  if (!part) return true;
+  uint8_t probe[64];
+  if (esp_partition_read(part, 0, probe, sizeof(probe)) != ESP_OK) return true;
+  for (size_t i = 0; i < sizeof(probe); ++i) if (probe[i] != 0xFF) return false;
+  return true;
+}
+
+bool flushModelUploadBuffer(bool padToWord) {
+  if (!modelUploadPartition || modelUploadBuffered == 0) return true;
+  size_t writeSize = modelUploadBuffered;
+  if (padToWord && (writeSize & 3U)) {
+    size_t padded = (writeSize + 3U) & ~((size_t)3U);
+    memset(modelUploadBuffer + writeSize, 0xFF, padded - writeSize);
+    writeSize = padded;
+  }
+  if (modelUploadOffset + writeSize > modelUploadPartition->size) return false;
+  esp_err_t e = esp_partition_write(modelUploadPartition, modelUploadOffset, modelUploadBuffer, writeSize);
+  if (e != ESP_OK) {
+    Serial.printf("[MODEL] flash write failed at 0x%zx: %s\n", modelUploadOffset, esp_err_to_name(e));
+    return false;
+  }
+  modelUploadOffset += writeSize;
+  modelUploadBuffered = 0;
+  return true;
+}
+
+void handleModelUploadStream() {
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    modelUploadPartition = findModelPartition();
+    modelUploadOk = modelUploadPartition != nullptr;
+    modelUploadHadError = !modelUploadOk;
+    modelUploadOffset = 0;
+    modelUploadBuffered = 0;
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) modelUploadHadError = true;
+    if (!modelUploadPartition) {
+      lastError = "model 分区不存在，请先使用 ESP-SR 分区表重新烧录";
+    } else if (!modelUploadHadError && assistantBusy) {
+      modelUploadHadError = true;
+      lastError = "语音助手正在处理任务，请稍后再上传模型";
+    } else if (!modelUploadHadError) {
+      // Stop model inference before erasing the partition it reads from.
+      if (srStarted || multiNetTaskHandle != nullptr) {
+        stopMultiNet();
+      }
+      if (multiNetTaskHandle != nullptr) {
+        modelUploadHadError = true;
+        modelUploadOk = false;
+        lastError = "MultiNet 检测任务未能安全停止，已取消模型擦除";
+        return;
+      }
+      setStage("准备写入 ESP-SR 模型分区");
+      esp_err_t e = esp_partition_erase_range(modelUploadPartition, 0, modelUploadPartition->size);
+      if (e != ESP_OK) {
+        modelUploadHadError = true;
+        lastError = String("擦除 model 分区失败：") + esp_err_to_name(e);
+      }
+    } else {
+      lastError = "只接受 .bin 模型文件";
+    }
+    Serial.printf("[MODEL] upload start: %s, partition=%s, size=%u\n", upload.filename.c_str(), modelUploadPartition ? "found" : "missing", modelUploadPartition ? (unsigned)modelUploadPartition->size : 0);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (modelUploadHadError || !modelUploadPartition) return;
+    const uint8_t *src = upload.buf;
+    size_t remain = upload.currentSize;
+    while (remain > 0) {
+      size_t room = sizeof(modelUploadBuffer) - modelUploadBuffered;
+      size_t n = remain < room ? remain : room;
+      memcpy(modelUploadBuffer + modelUploadBuffered, src, n);
+      modelUploadBuffered += n;
+      src += n;
+      remain -= n;
+      if (modelUploadBuffered == sizeof(modelUploadBuffer) && !flushModelUploadBuffer(false)) {
+        modelUploadHadError = true;
+        lastError = "写入 model 分区失败";
+        return;
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (modelUploadHadError || !modelUploadPartition) return;
+    if (!flushModelUploadBuffer(true)) {
+      modelUploadHadError = true;
+      lastError = "写入模型文件末尾失败";
+      return;
+    }
+    if (modelUploadOffset < 1024) {
+      modelUploadHadError = true;
+      lastError = "模型文件过小，不像有效的 srmodels.bin";
+    } else {
+      modelUploadOk = true;
+      lastError = "模型包已写入；具体模型名称和 ESP-SR 版本兼容性仍需验证";
+      setStage("模型已写入，请重启设备");
+      Serial.printf("[MODEL] upload complete: %u bytes\n", (unsigned)modelUploadOffset);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    modelUploadHadError = true;
+    modelUploadOk = false;
+    lastError = "模型上传中断；请重新上传完整 srmodels.bin";
+  }
+}
+
+void handleModelUploadDone() {
+  JsonDocument r;
+  if (modelUploadHadError || !modelUploadOk) {
+    r["error"] = lastError.isEmpty() ? "模型上传失败" : lastError;
+    sendJson(500, r);
+    return;
+  }
+  r["ok"] = true;
+  r["bytes"] = modelUploadOffset;
+  r["message"] = "通用 MultiNet 模型包已写入。重启后固件会把当前拼音命令动态加入模型；该文件本身不含专属唤醒词权重。";
+  sendJson(200, r);
+}
+
+void handleStatus() {
+  JsonDocument d;
+  d["wifi"] = WiFi.status() == WL_CONNECTED ? "已连接" : "配置热点";
+  d["ip"] = ipAddress();
+  d["heap"] = ESP.getFreeHeap() / 1024;
+  d["psram"] = ESP.getFreePsram() / 1024;
+  d["stage"] = stageText;
+  d["recognizer"] = recognizerStatus;
+  d["ns"] = lastNsStatus;
+  d["transcript"] = lastTranscript;
+  d["reply"] = lastReply;
+  d["error"] = lastError;
+  const esp_partition_t *mp = findModelPartition();
+  if (!mp) d["modelStatus"] = "model 分区不存在";
+  else if (modelPartitionBlank(mp)) d["modelStatus"] = "model 分区为空，尚未上传 srmodels.bin";
+  else d["modelStatus"] = recognizerStatus;
+  sendJson(200, d);
+}
+
+void handleScan() {
+  int n = WiFi.scanNetworks(false, true, false, 250);
+  JsonDocument d;
+  JsonArray arr = d["networks"].to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["ssid"] = WiFi.SSID(i);
+    o["rssi"] = WiFi.RSSI(i);
+    o["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+  }
+  WiFi.scanDelete();
+  sendJson(200, d);
+}
+
+void handleGetConfig() {
+  JsonDocument d;
+  d["wifiSsid"] = cfg.wifiSsid;
+  d["llmProvider"] = cfg.llmProvider; d["llmEndpoint"] = cfg.llmEndpoint;
+  d["llmModel"] = cfg.llmModel; d["systemPrompt"] = cfg.systemPrompt;
+  d["llmKeyConfigured"] = !cfg.llmApiKey.isEmpty();
+  d["asrProvider"] = cfg.asrProvider; d["asrEndpoint"] = cfg.asrEndpoint;
+  d["asrModel"] = cfg.asrModel; d["asrKeyConfigured"] = !cfg.asrApiKey.isEmpty();
+  d["ttsProvider"] = cfg.ttsProvider; d["ttsEndpoint"] = cfg.ttsEndpoint;
+  d["ttsModel"] = cfg.ttsModel; d["ttsVoice"] = cfg.ttsVoice;
+  d["ttsSpeed"] = cfg.ttsSpeed; d["ttsKeyConfigured"] = !cfg.ttsApiKey.isEmpty();
+  d["wakeWordZh"] = cfg.wakeWordZh; d["wakeWordPinyin"] = cfg.wakeWordPinyin;
+  d["wakeThreshold"] = cfg.wakeThreshold; d["wakeDurationMs"] = cfg.wakeDurationMs;
+  d["noiseSuppression"] = cfg.noiseSuppression; d["keepApEnabled"] = cfg.keepApEnabled;
+  sendJson(200, d);
+}
+
+bool normalizeMultiNetPinyin(String &pinyin) {
+  pinyin.trim();
+  pinyin.toLowerCase();
+  String normalized;
+  bool previousSpace = true;
+  for (size_t i = 0; i < pinyin.length(); ++i) {
+    char c = pinyin[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      if (!previousSpace) { normalized += ' '; previousSpace = true; }
+      continue;
+    }
+    if (c < 'a' || c > 'z') return false; // Mandarin MultiNet6 input uses untoned pinyin syllables.
+    normalized += c;
+    previousSpace = false;
+  }
+  normalized.trim();
+  if (normalized.length() < 3 || normalized.length() > 96 || normalized.indexOf(' ') < 0) return false;
+  pinyin = normalized;
+  return true;
+}
+
+void handleSaveConfig(
