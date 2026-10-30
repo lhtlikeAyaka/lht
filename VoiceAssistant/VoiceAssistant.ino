@@ -22,7 +22,7 @@
 #include <NetworkClient.h>
 #include <NetworkClientSecure.h>
 #include <ESP_I2S.h>
-#include <esp_srmodel.h>
+#include <model_path.h>
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
