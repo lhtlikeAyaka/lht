@@ -1,0 +1,45 @@
+name: Build ESP32-S3 voice assistant firmware
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'VoiceAssistant/**'
+      - 'partitions/voiceassistant_multinet.csv'
+      - '.github/workflows/build-firmware.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core 3.3.5 and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.5
+          arduino-cli lib install ArduinoJson
+      - name: Install custom partition table
+        run: |
+          PART_DIR="$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.5/tools/partitions"
+          mkdir -p "$PART_DIR"
+          cp partitions/voiceassistant_multinet.csv "$PART_DIR/voiceassistant_multinet.csv"
+      - name: Compile
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi' \
+            --build-property 'build.partitions=voiceassistant_multinet' \
+            --build-property 'upload.maximum_size=3145728' \
+            --output-dir build \
+            VoiceAssistant
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-assistant-esp32s3-firmware
+          path: build/*.bin
+          if-no-files-found: error
