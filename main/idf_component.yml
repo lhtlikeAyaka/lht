@@ -1,0 +1,9 @@
+dependencies:
+  # Arduino framework used by the existing .ino sketch.
+  espressif/arduino-esp32:
+    version: "3.3.5"
+  # Keep runtime libraries and the standalone model builder on the same ESP-SR release.
+  espressif/esp-sr:
+    version: "2.1.5"
+  bblanchon/arduinojson:
+    version: "7.4.2"
