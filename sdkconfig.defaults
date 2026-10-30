@@ -18,5 +18,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/voiceassistant_multinet.csv"
 
 # Pre-trained Chinese MultiNet 6 model, paired with its FST graph.
 CONFIG_SR_MN_CN_MULTINET6_QUANT=y
-# Fix Arduino-ESP32 NetworkClientSecure SSL symbols
+
+# Enable the PSK modes menu and its symmetric PSK key exchange for Arduino TLS.
+CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
