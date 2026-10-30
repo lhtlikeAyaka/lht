@@ -5,6 +5,9 @@ on:
   push:
     paths:
       - 'VoiceAssistant/**'
+      - 'main/**'
+      - 'CMakeLists.txt'
+      - 'sdkconfig.defaults'
       - 'partitions/voiceassistant_multinet.csv'
       - '.github/workflows/build-firmware.yml'
 
@@ -14,32 +17,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v2
-      - name: Install ESP32 core 3.3.5 and libraries
+
+      - name: Install ESP-IDF v5.5.1
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: "v5.5.1"
+
+      - name: Configure ESP32-S3 target
+        run: idf.py set-target esp32s3
+
+      - name: Build firmware and ESP-SR model bundle
+        run: idf.py build
+
+      - name: Prepare flash artifacts
+        shell: bash
         run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.5
-          arduino-cli lib install ArduinoJson
-      - name: Install custom partition table
-        run: |
-          PART_DIR="$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.5/tools/partitions"
-          mkdir -p "$PART_DIR"
-          cp partitions/voiceassistant_multinet.csv "$PART_DIR/voiceassistant_multinet.csv"
-      - name: Compile
-        run: |
-          mkdir -p build
-          arduino-cli compile \
-            --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi' \
-            --build-property 'build.partitions=voiceassistant_multinet' \
-            --build-property 'upload.maximum_size=3145728' \
-            --output-dir build \
-            VoiceAssistant
-      - name: Upload firmware artifact
+          set -euo pipefail
+          mkdir -p artifacts
+          test -s build/bootloader/bootloader.bin
+          test -s build/partition_table/partition-table.bin
+          test -s build/voice_assistant.bin
+          test -s build/srmodels/srmodels.bin
+          cp build/bootloader/bootloader.bin artifacts/
+          cp build/partition_table/partition-table.bin artifacts/
+          cp build/voice_assistant.bin artifacts/
+          cp build/srmodels/srmodels.bin artifacts/
+          cat > artifacts/flash-offsets.txt <<'INFO'
+          ESP32-S3-N16R8 flash layout (16 MB)
+          bootloader.bin       0x000000
+          partition-table.bin  0x008000
+          voice_assistant.bin  0x010000 (app0)
+          srmodels.bin         0x9F0000 (model partition)
+
+          Do not flash srmodels.bin at the application address.
+          Use the exact offsets above with esptool.py write_flash.
+          INFO
+
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: voice-assistant-esp32s3-firmware
-          path: build/*.bin
+          name: voice-assistant-esp32s3-idf-firmware
+          path: artifacts/*
           if-no-files-found: error
