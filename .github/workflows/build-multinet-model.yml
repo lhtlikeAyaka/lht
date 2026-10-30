@@ -1,0 +1,27 @@
+name: Build ESP-SR MultiNet 6 model bundle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/build_multinet_model.sh'
+      - '.github/workflows/build-multinet-model.yml'
+
+jobs:
+  build-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y git git-lfs python3
+      - name: Build srmodels.bin (mn6_cn + fst)
+        run: bash tools/build_multinet_model.sh
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-sr-mn6-cn-model
+          path: |
+            output/srmodels.bin
+            output/model-info.txt
+          if-no-files-found: error

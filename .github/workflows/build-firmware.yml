@@ -26,10 +26,21 @@ jobs:
       - name: Configure ESP32-S3 target
         run: idf.py set-target esp32s3
 
-      - name: Build firmware and ESP-SR model bundle
+      - name: Verify project entry and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s main/main.cpp
+          test -s main/CMakeLists.txt
+          test -s main/idf_component.yml
+          grep -q 'extern "C" void app_main' main/main.cpp
+          grep -q 'CONFIG_AUTOSTART_ARDUINO=n' sdkconfig.defaults
+          grep -q 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' sdkconfig.defaults
+
+      - name: Build firmware and bundled ESP-SR model
         run: idf.py build
 
-      - name: Prepare flash artifacts
+      - name: Validate and prepare flash artifacts
         shell: bash
         run: |
           set -euo pipefail
@@ -38,6 +49,12 @@ jobs:
           test -s build/partition_table/partition-table.bin
           test -s build/voice_assistant.bin
           test -s build/srmodels/srmodels.bin
+
+          APP_BYTES="$(stat -c '%s' build/voice_assistant.bin)"
+          MODEL_BYTES="$(stat -c '%s' build/srmodels/srmodels.bin)"
+          (( APP_BYTES <= 3145728 )) || { echo "Application is ${APP_BYTES} bytes; app partition is 3 MiB"; exit 1; }
+          (( MODEL_BYTES <= 6291456 )) || { echo "Model bundle is ${MODEL_BYTES} bytes; model partition is 6 MiB"; exit 1; }
+
           cp build/bootloader/bootloader.bin artifacts/
           cp build/partition_table/partition-table.bin artifacts/
           cp build/voice_assistant.bin artifacts/
@@ -51,7 +68,9 @@ jobs:
 
           Do not flash srmodels.bin at the application address.
           Use the exact offsets above with esptool.py write_flash.
+          First migration to this partition table requires a full reflash.
           INFO
+          printf 'Application size: %s bytes\\nModel bundle size: %s bytes\\n' "$APP_BYTES" "$MODEL_BYTES" > artifacts/build-sizes.txt
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
