@@ -1,5 +1,6 @@
-# Arduino-ESP32 3.3.5 running as an ESP-IDF component
-CONFIG_AUTOSTART_ARDUINO=y
+# Arduino is initialized explicitly by main/app_main.cpp.
+# This avoids relying on the Arduino component's optional app_main autostart.
+CONFIG_AUTOSTART_ARDUINO=n
 CONFIG_FREERTOS_HZ=1000
 
 # ESP32-S3-N16R8: 16 MB flash + 8 MB OPI PSRAM
@@ -11,9 +12,9 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_BOOT_INIT=y
 
-# The custom table contains OTA app slots and the ESP-SR model partition.
+# Custom table includes two 3 MB OTA slots and the ESP-SR model partition.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/voiceassistant_multinet.csv"
 
-# Select the exact generic Chinese MultiNet 6 model and its FST graph.
+# Pre-trained Chinese MultiNet 6 model, paired with its FST graph.
 CONFIG_SR_MN_CN_MULTINET6_QUANT=y
